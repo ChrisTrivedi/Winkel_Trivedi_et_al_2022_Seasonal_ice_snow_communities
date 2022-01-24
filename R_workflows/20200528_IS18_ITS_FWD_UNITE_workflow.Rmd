@@ -1,0 +1,268 @@
+---
+title: "IS18 ITS Workflow using updated UNITE db"
+subtitle: "Still using only FWD reads, now with updated UNITE db released in Feb 2020. This db includes all Euks"
+author: "Chris Trivedi"
+date: "28 May, 2020"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+### First load the saved .RData file
+```{r}
+load("C:/Users/ctrivedi/Google Drive/PostDoc/Bioinformatics/GeoMicro_Server_after_analysis/DL_from_Server/IS18_ITS_dada2/FWD_only/20190917_IS18_ITS_DADA2_FWDreads.RData")
+```
+
+### Now load our pertinent packages
+```{r}
+library(dada2); packageVersion("dada2")
+```
+
+
+<!-- Ref_db <- "/opt/databases/DADA2/dada2_training_data/silva_nr_v132_train_set.fa.gz"  # CHANGE ME to location on your machine -->
+
+### Set our path to the UNITE database
+```{r}
+unite.ref_new <- "C:/Users/ctrivedi/Google Drive/PostDoc/Bioinformatics/GeoMicro_Server_after_analysis/Databases/UNITE_database/sh_general_release_all_04.02.2020_fixed.fasta"
+```
+
+
+### Re-assign taxonomy
+```{r}
+FWD_taxa_UNITE_new <- assignTaxonomy(FWD_seqtab.nochim, unite.ref_new, multithread = 4, tryRC = TRUE, verbose = TRUE)
+
+FWD_taxa_UNITE_new.print <- FWD_taxa_UNITE_new  # Removing sequence rownames for display only
+rownames(FWD_taxa_UNITE_new.print) <- NULL
+head(FWD_taxa_UNITE_new.print, n=10)
+```
+
+
+### Re-do track reads and output to table
+```{r}
+getN <- function(x) sum(getUniques(x))
+
+  # making a little table
+FWD_summary_tab <- data.frame(row.names=sample.names, dada2_input=out[,1],
+               filtered=out[,2], dada_f=sapply(dadaFs, getN),
+               #dada_r=sapply(dada_reverse, getN), 
+               #merged=sapply(merged_amplicons, getN),
+               nonchim=rowSums(FWD_seqtab.nochim),
+               final_perc_reads_retained=round(rowSums(FWD_seqtab.nochim)/out[,1]*100, 1))
+
+FWD_summary_tab
+
+write.table(FWD_summary_tab, "output/IS18_ITS_FWD_read_counts.tsv", sep="\t", quote=F, col.names=NA)
+```
+
+
+### Output files for analysis outside of R
+```{r}
+write.csv(FWD_taxa_UNITE_new, "output/taxa_table_1st_try.csv")
+
+write.csv(FWD_seqtab.nochim, "output/FWD_seqtab_nochim_1st_try.csv")
+```
+
+
+### From Mike's workflow (probably better for analysis outside of R)
+```{r}
+ # giving our seq headers more manageable names (ASV_1, ASV_2...)
+asv_seqs <- colnames(FWD_seqtab.nochim)
+asv_headers_2 <- vector(dim(FWD_seqtab.nochim)[2], mode="character")
+
+for (i in 1:dim(FWD_seqtab.nochim)[2]) {
+  asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+
+  # making and writing out a fasta of our final ASV seqs:
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+write(asv_fasta, "output/IS18_ITS_FWD_ASVs.fa")
+
+  # count table:
+asv_tab <- t(FWD_seqtab.nochim)
+row.names(asv_tab) <- sub(">", "", asv_headers)
+write.table(asv_tab, "output/IS18_ITS_FWD_ASV_counts.tsv", sep="\t", quote=F, col.names=NA)
+
+  # tax table:
+asv_tax <- FWD_taxa_UNITE_new
+row.names(asv_tax) <- sub(">", "", asv_headers)
+write.table(asv_tax, "output/IS18_ITS_FWD_ASV_taxonomy.tsv", sep="\t", quote=F, col.names=NA)
+
+# add ASV numbers to asv_seq and merge together
+asv_merge <- data.frame(asv_tab, asv_tax, asv_seqs)
+write.csv(asv_merge, "output/IS18_ITS_FWD_counts_taxa_seqs_merged.csv")
+
+# This should be the same, but I wanted to make sure things merged based on ASV name, however it causes all sorts of problems with sorting.
+asv_seqs3 <- as.data.frame(colnames(FWD_seqtab.nochim))
+row.names(asv_seqs3) <- row.names(asv_tab)
+asv_merge2 <- merge(asv_tab, asv_tax, by="row.names")
+row.names(asv_merge2) <- asv_merge2$Row.names
+asv_merge3 <- merge(asv_merge2, asv_seqs3, by="row.names")
+asv_merge3 <- asv_merge3[,-1]
+write.table(asv_merge3, "output/IS18_ITS_FWD_counts_taxa_seqs_merged_other.tsv", sep="\t", quote=F, col.names=NA)
+
+```
+
+
+### Load phyloseq and ggplot2 - Beginning of analyses
+```
+library(phyloseq); packageVersion("phyloseq")
+library(ggplot2); packageVersion("ggplot2")
+theme_set(theme_bw())
+```
+
+### Linking metadata file and matching up sample names
+```
+samdf <- read.csv("C:/Users/ctrivedi/Google Drive/PostDoc/Bioinformatics/GeoMicro_Server_after_analysis/DL_from_Server/20190321_IS18_18S_Map.csv", header=TRUE)
+all(rownames(FWD_seqtab.nochim) %in% samdf$X.SampleID) # Test to see if names match up
+rownames(samdf) <- samdf$X.SampleID
+```
+
+### Create phyloseq object and look at stats
+```
+FWD_UNITE_new_ps <- phyloseq(otu_table(FWD_seqtab.nochim, taxa_are_rows=FALSE), 
+               sample_data(samdf), 
+               tax_table(FWD_taxa_UNITE_new)
+               #, phy_tree(FWD_fitGTR$tree)
+               )
+FWD_UNITE_ps
+```
+
+### Save phyloseq object for handing off or just in case
+```
+saveRDS(FWD_UNITE_new_ps, here("FWD_only", "PS_objects", "FWD_UNITE_new_ps.rds"))
+```
+
+<!-- ### Save individual files that make up phyloseq object -->
+<!-- ``` -->
+<!-- saveRDS(FWD_seqtab.nochim, file="FWD_otu_table.rds") -->
+<!-- saveRDS(samdf, file="sample_data.rds") -->
+<!-- saveRDS(FWD_taxa, file="FWD_taxa_table.rds") -->
+<!-- saveRDS(FWD_fitGTR, file="FWD_phangorn_tree.rds") -->
+<!-- ``` -->
+
+### Bar charts across all samples on the Phylum level
+```{r, warning=FALSE}
+plot_bar(FWD_UNITE_new_ps, "Sample_sheet_name", fill = "Phylum") + theme(legend.position="bottom")
+```
+
+### Observing general richness across sites
+```{r}
+plot_richness(FWD_ps, measures = c("Observed", "Chao1", "Shannon", "Simpson"), x= "X.SampleID")
+```
+
+### Subset to top 50 ASVs, save the Phyloseq object to make things easier in the future
+```
+<!-- AUS_ITS_ps_noBlank = subset_samples(AUS_ITS_ps, X.SampleID != "Blank-A06") -->
+
+most_abundant_taxa_all_UNITE = sort(taxa_sums(FWD_UNITE_ps), TRUE)
+
+top50 = 50
+IS18_ITS_UNITE_new_50 = sort(taxa_sums(FWD_UNITE_new_ps), TRUE)[1:top50]
+print(IS18_ITS_UNITE_new_50)
+
+IS18_ITS_UNITE_new_50_ps = prune_taxa(names(most_abundant_taxa_UNITE_new_50), FWD_UNITE_new_ps)
+
+saveRDS(IS18_ITS_UNITE_50_ps, here("PS_objects", "IS18_ITS_UNITE_50_ps.rds"))
+```
+
+### How many seqs did we lose by subsetting?
+```{r}
+sum(colSums(otu_table(FWD_UNITE_new_ps)))
+
+sum(colSums(otu_table(IS18_ITS_UNITE_new_50_ps)))
+```
+
+
+### View again as Top 50 ASVs (and no Blank)
+```{r, warning=FALSE}
+plot_bar(IS18_ITS_UNITE_new_50_ps, "Sample_sheet_name", fill = "Class"
+         #, facet_grid = "Sample_sheet_name"
+         ) + theme(legend.position="bottom")
+```
+
+RelAbund_UNITE_new  = transform_sample_counts(IS18_ITS_UNITE_new_50_ps, function(x) x / sum(x) ) # transform to relative abundance
+
+```{r, warning=FALSE}
+plot_bar(RelAbund_UNITE_new, "Sample_sheet_name", fill = "Class"
+         #, facet_grid = "Sample_sheet_name"
+         ) + theme(legend.position="bottom")
+```
+
+### Let's ordinate our samples and see how they compare
+```{r}
+p_ord <- plot_ordination(IS18_ITS_UNITE_new_50_ps, ordinate(IS18_ITS_UNITE_new_50_ps, "NMDS", "bray"), type = "samples", color = "Site", shape = "Type") + geom_point(size = 3) 
+
+p_ord + geom_text(check_overlap = TRUE, mapping = aes(label=Sample_sheet_name), size =3, vjust = 1.8) + theme_bw() #+ facet_wrap(AUS_ITS_ps)
+```
+
+### Now by samples and associated top level Phyla
+```{r}
+plot_ordination(IS18_ITS_UNITE_new_50_ps, ordinate(IS18_ITS_UNITE_new_50_ps, "NMDS", "bray"), type = "taxa", color = "Phylum", shape = "Type", label = "Sample_sheet_name") + geom_point(size = 3) #+ facet_wrap(AUS_ITS_ps)
+```
+
+### Lastly, a heat map ordered by site and resolved at the Class level
+```{r}
+plot_heatmap(IS18_ITS_UNITE_new_50_ps, method = "NMDS", distance = "bray", sample.label = "Sample_sheet_name", 
+             #sample.order ="Month",  
+             taxa.label = "Phylum")
+```
+
+### Save individual files that make up phyloseq object
+```
+saveRDS(FWD_seqtab.nochim, file="FWD_otu_table.rds")
+saveRDS(samdf, file="sample_data.rds")
+saveRDS(FWD_taxa, file="FWD_taxa_table.rds")
+saveRDS(FWD_fitGTR, file="FWD_phangorn_tree.rds")
+```
+
+
+
+## Tree file
+
+<!-- ### Making a tree file -->
+
+<!-- <div style="border: 1px solid red;padding: 5px;background-color: #fff6f6;"> -->
+<!-- <strong><span style="color:red">Note:</span></strong> Multiple ways to make tree files - phangorn is decent with smaller sets of data (<1000 ASVs), otherwise it's good to use RAxmL, but this takes tons longer. **Gloria Iriarte** put together a very nice workflow for using ITS data (which often has variable seq length) and then producing a tree from RAxmL. -->
+
+<!-- In this case we use some code B. Stamps put together to use DECIPHER and Phangorn. -->
+<!-- </div> -->
+
+<!-- Install/load phangorn and DECIPHER -  -->
+<!-- * DECIPHER will be used in this instance for sequence alignment -->
+<!-- * phangorn will be used to create the tree file -->
+
+<!-- ``` -->
+<!-- if (!requireNamespace("BiocManager", quietly=TRUE)) -->
+<!--     install.packages("BiocManager") -->
+<!-- BiocManager::install("DECIPHER") -->
+<!-- ``` -->
+<!-- ``` -->
+<!-- library(phangorn) -->
+<!-- library(DECIPHER) -->
+<!-- ``` -->
+
+<!-- ### From Blake - making a tree for phyloseq -->
+<!-- ``` -->
+<!-- FWD_seqs <- getSequences(FWD_seqtab.nochim) -->
+<!-- names(FWD_seqs) <- FWD_seqs # This propagates to the tip labels of the tree -->
+
+<!-- FWD_alignment <- AlignSeqs(DNAStringSet(FWD_seqs), anchor=NA,verbose=TRUE) -->
+
+<!-- FWD_phangAlign <- phyDat(as(FWD_alignment, "matrix"), type="DNA") -->
+<!-- FWD_dm <- dist.ml(FWD_phangAlign) -->
+<!-- FWD_treeNJ <- NJ(FWD_dm) # Note, tip order != sequence order -->
+
+<!-- FWD_fit = pml(FWD_treeNJ, data=FWD_phangAlign) -->
+<!-- FWD_fitGTR <- update(FWD_fit, k=4, inv=0.2) -->
+<!-- FWD_fitGTR <- optim.pml(FWD_fitGTR, model="GTR", optInv=TRUE, optGamma=TRUE, -->
+<!--         rearrangement = "stochastic", control = pml.control(trace = 0)) -->
+<!-- detach("package:phangorn", unload=TRUE) -->
+<!-- ``` -->
+
+```html
+<div style="border: 1px solid red;padding: 5px;background-color: #fff6f6;">
+<strong><span style="color:red">Note:</span></strong> Phangorn should work in this case with only three (3) files, however, haven't made a tree yet, but will do so later. No tree as of 17 Sep, 2019.
+</div>
+```
+
+
