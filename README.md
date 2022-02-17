@@ -6,4 +6,5 @@ Contained here are R files used to process raw Illumina paired-end amplicon data
 
 The workflow follows that of [processing marker gene sequences](http://benjjneb.github.io/dada2/tutorial.html) via DADA2 in R as provided by Ben Callahan.
 
-[![DOI](https://zenodo.org/badge/451418434.svg)](https://zenodo.org/badge/latestdoi/451418434)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.6123251.svg)](https://doi.org/10.5281/zenodo.6123251)
+
