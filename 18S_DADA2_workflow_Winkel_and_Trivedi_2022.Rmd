@@ -1,0 +1,293 @@
+---
+title: "DADA2 18S workflow for Winkel & Trivedi et al., 2022"
+author: Winkel & Trivedi et al., 2022
+output: html_notebook
+---
+
+This workflow is based on the DADA2 pipeline tutorial provided by the creator of DADA2 Benjamin Callahan, and can be found here - https://benjjneb.github.io/dada2/tutorial.html
+
+
+### First thing´s first - save as a standalone R project (this will set your working directory for you) - Don't use `setwd()` if you can help it!
+
+
+### This workflow uses the following packages:
+```{r}
+library("here")
+library(dada2); packageVersion("dada2")
+library(phyloseq); packageVersion("phyloseq")
+library(ggplot2); packageVersion("ggplot2")
+library(Biostrings); packageVersion("Biostrings")
+```
+
+
+### Set the path to your unzipped data and list the present files
+```{r}
+path <- "/path/to/raw/data/files/" # CHANGE ME to the directory containing the fastq files.
+list.files(path)
+```
+
+### Along with the raw data you will need a mapping/metadata file (typically in CSV format).
+
+
+### Generating the list of F and R reads (can also be in .gz format - no need to extract).
+```{r}
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq", full.names = TRUE))
+
+### Extract and show sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+sample.names
+```
+
+
+# Check to make sure all samples match those in the mapping file (need to have exact matches)
+```{r}
+metadata_path <- here("Mapping_file.csv")
+samdf <- read.csv(metadata_path, header=TRUE, check.names=FALSE, sep=",")
+all(sample.names %in% samdf$Seq_ID) # Testing to see if sample.names (pulled from the raw data file names) match a column in the mapping file called Seq_ID.
+```
+
+
+### Inspect quality profiles
+```{r}
+plotQualityProfile(fnFs[1:2]) #Forward reads
+plotQualityProfile(fnRs[1:2]) #Reverse reads
+```
+
+We can use the quality profile plots to determine where the forward and reverse reads need to be trimmed (during the filterAndTrim step). This would be input specifically in the flag "truncLen=").Note that Illumina 2x300 v3 chemistry kit tends to look much worse for the Rev reads than the v2 chemistry.
+
+
+### Place filtered files in filtered/ subdirectory
+```{r}
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+```
+
+
+### Trim
+```{r}
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(280,200),
+              maxN=0, maxEE=c(2,5), truncQ=2, rm.phix=TRUE,
+              compress=TRUE, multithread=TRUE) # If running on Windows set multithread=FALSE
+head(out)
+
+# You can specify the number of threads to utilize when using a shared resource
+
+# If you are losing many sequences you can also change the maxEE to allow more mismatches (this is especially helpful with low quality Rev reads)
+```
+
+
+### DADA2 uses a parametric error model and every amplicon set has different error rates - we can create a model of our data and use this down the line to help evaluate our reads.
+
+```{r}
+errF <- learnErrors(filtFs, multithread=8, verbose=TRUE)
+errR <- learnErrors(filtRs, multithread=8, verbose=TRUE)
+```
+
+
+### Visualize the error rates as a sanity check
+```{r}
+plotErrors(errF, nominalQ=TRUE)
+plotErrors(errR, nominalQ=TRUE)
+```
+
+
+### Sample Inference
+```{r}
+dadaFs <- dada(filtFs, err=errF, multithread=8, verbose = TRUE)
+dadaRs <- dada(filtRs, err=errR, multithread=8, verbose = TRUE)
+
+dadaFs[[1]]
+dadaRs[[1]]
+```
+
+
+# Name the new inference files by the sample names or they won't agree with your mapping file when handing off to phyloseq.
+```{r}
+names(dadaFs) <- sample.names
+names(dadaRs) <- sample.names
+```
+
+
+### Merge paired reads
+```{r}
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+```
+
+
+### Construct sequence table
+```{r}
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+```
+
+
+### Inspect distribution of sequence lengths
+```{r}
+seqlengths <- table(nchar(getSequences(seqtab)))
+```
+
+
+### Number of reads associated with each length
+```{r}
+readnumbers <- tapply(colSums(seqtab), nchar(colnames(seqtab)), sum)
+```
+
+
+### Plotting those results
+```{r}
+table <- as.data.frame(table(nchar(colnames(seqtab))))
+colnames(table) <- c("LENGTH","COUNT")
+
+ggplot(table,aes(x=LENGTH,y=COUNT)) + 
+  geom_histogram(stat="identity") + 
+  ggtitle("Sequence Lengths by SEQ Count") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5,size=10)) +
+  theme(axis.text.y=element_text(size=10))
+
+table2 <- tapply(colSums(seqtab), nchar(colnames(seqtab)), sum)
+table2 <- data.frame(key=names(table2), value=table2)
+
+colnames(table2) <- c("LENGTH","ABUNDANCE")
+
+ggplot(table2,aes(x=LENGTH,y=ABUNDANCE)) + 
+  geom_histogram(stat="identity") + 
+  ggtitle("Sequence Lengths by SEQ Abundance") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5,size=10)) +
+  theme(axis.text.y=element_text(size=10))
+```
+
+
+### Remove non-target length sequences (due to non-specific priming)
+```{r}
+seqtab2 <- seqtab[,nchar(colnames(seqtab)) %in% 402:430] # These values should be selected base on what the above plot shows.
+table(nchar(getSequences(seqtab2)))
+```
+
+
+### Removing chimeras
+```{r}
+seqtab.nochim <- removeBimeraDenovo(seqtab2, method="consensus", multithread=16, verbose=TRUE)
+dim(seqtab.nochim)
+sum(seqtab.nochim)/sum(seqtab)
+```
+
+
+### Track reads and output to table (Credit to Mike Lee from his Happy Belly Bioinformatics website for this code)
+```{r}
+getN <- function(x) sum(getUniques(x))
+
+  # making a little table
+Reads_summary_tab <- data.frame(row.names=sample.names, 
+                                dada2_input=out[,1],
+               filtered=out[,2], 
+               dada_f=sapply(dadaFs, getN),
+               dada_r=sapply(dadaRs, getN), 
+               merged=sapply(mergers, getN),
+               nonchim=rowSums(seqtab.nochim),
+               final_perc_reads_retained=round(rowSums(seqtab.nochim)/out[,1]*100, 1))
+
+head(Reads_summary_tab)
+
+dir.create(here("output"))
+
+write.table(Reads_summary_tab, "output/track_reads.tsv", sep="\t", quote=F, col.names=NA)
+```
+
+
+
+### Assigning taxonomy (you will need to download this database from the DADA2 website)
+```{r}
+taxa <- assignTaxonomy(seqtab.nochim, "/opt/databases/DADA2/dada2_training_data/silva_nr_v132_train_set.fa.gz", multithread=8)
+```
+
+
+<!-- ### Can also attempt to call species level on exact matches
+```{r}
+taxa <- addSpecies(taxa, "/opt/databases/DADA2/dada2_training_data/silva_species_assignment_v132.fa.gz")
+``` -->
+
+
+### Inspect Assignments
+```{r}
+taxa.print <- taxa # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+```
+
+
+At this point a phylogenetic tree can be created (which can be added to your phyloseq object). If you have fewer than 2000 ASVs then an R package called phangorn can be used. Over 2000 ASVs and it is best to use RAxML.
+
+
+### Output final files before input into phyloseq (credit to Mike Lee from Happy Belly Bioinformatics). This is useful if you prefer to use other tools than phyloseq for further analysis and visualization:
+- Fasta file of ASVs
+- ASV count table (as .tsv)
+- ASV taxonomy table (as .tsv)
+- Merged file including the above (as .csv)
+
+```{r}
+ # giving our seq headers more manageable names (ASV_1, ASV_2...)
+asv_seqs <- colnames(seqtab.nochim)
+asv_headers <- vector(dim(seqtab.nochim)[2], mode="character")
+
+for (i in 1:dim(seqtab.nochim)[2]) {
+  asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+
+  # making and writing out a fasta of our final ASV seqs:
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+write(asv_fasta, "output/18S_ASVs.fa")
+
+  # count table:
+asv_tab <- t(seqtab.nochim)
+row.names(asv_tab) <- sub(">", "", asv_headers)
+write.table(asv_tab, "output/18S_ASV_counts.tsv", sep="\t", quote=F, col.names=NA)
+
+  # tax table:
+asv_tax <- taxa
+row.names(asv_tax) <- sub(">", "", asv_headers)
+write.table(asv_tax, "output/18S_ASV_taxonomy.tsv", sep="\t", quote=F, col.names=NA)
+
+# add ASV numbers to asv_seq and merge together
+asv_merge <- data.frame(asv_tab, asv_tax, asv_seqs)
+write.csv(asv_merge, "output/18S_counts_taxa_seqs_merged.csv")
+```
+
+
+### Create phyloseq object and look at stats
+```{r}
+#tree <- read_tree(fitGTR$tree) # if you created a tree
+
+all(rownames(seqtab.nochim) %in% samdf$Seq_ID) # This checks the names in your seq table with those in your metadata file
+rownames(samdf) <- samdf$"Seq_ID"
+  
+18S_ps <- phyloseq(tax_table(taxa), 
+          sample_data(samdf),
+          otu_table(seqtab.nochim, taxa_are_rows = FALSE)#, phy_tree(tree)
+                              ) 
+
+# remove seqs as ASV names and put into refseq slot of phyloseq object. Rename ASVs to something more manageable.
+dna <- Biostrings::DNAStringSet(taxa_names(18S_ps))
+names(dna) <- taxa_names(18S_ps)
+18S_ps <- merge_phyloseq(18S_ps, dna)
+taxa_names(18S_ps) <- paste0("ASV", seq(ntaxa(18S_ps)))
+
+
+### View your new phyloseq object
+18S_ps
+
+
+### Create a new directory and save your phyloseq object as an RDS file for posterity
+dir.create(here("PS_objects"))
+
+# Save RDS for easy loading later on
+saveRDS(18S_ps, here("PS_objects", "18S_ps.rds"))
+```
+
+This is the end of the workflow up to the point of processing and generating ASVs along with taxonomy calling. Phyloseq can now be utilized for further analysis and data visualization.

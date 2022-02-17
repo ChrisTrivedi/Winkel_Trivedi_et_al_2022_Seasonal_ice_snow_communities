@@ -1,0 +1,337 @@
+---
+title: "DADA2 ITS workflow for Winkel & Trivedi et al., 2022"
+author: "CWinkel & Trivedi et al., 2022"
+output: html_notebook
+---
+
+This workflow is based on the DADA2 pipeline tutorial provided by the creator of DADA2 Benjamin Callahan, and can be found here - https://benjjneb.github.io/dada2/ITS_workflow.html
+
+
+### First thing´s first - save as a standalone R project (this will set your working directory for you) - Don't use `setwd()` if you can help it!
+
+
+### This workflow uses the following packages:
+```{r}
+library("here")
+library(dada2); packageVersion("dada2")
+library(phyloseq); packageVersion("phyloseq")
+library(ggplot2); packageVersion("ggplot2")
+library(Biostrings); packageVersion("Biostrings")
+library(ShortRead); packageVersion("ShortRead")
+```
+
+
+### Defining the path to our raw data and confirming that it's correct
+```{r}
+path <- "/path/to/raw/data/files/" # CHANGE ME to the directory containing the fastq files.
+list.files(path)
+```
+
+Along with the raw data you will need a mapping/metadata file (typically in CSV format).
+
+
+### Generating the list of F and R reads (can also be in .gz format - no need to extract).
+```{r}
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq", full.names = TRUE))
+
+### Extract and show sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+sample.names
+```
+
+
+The ITS workflow requires a bit of extra work before the typicall DADA2 analysis where we identify and remove primers using a 3rd party tool (in this case cutadapt).
+
+
+### Identify ITS primers and view
+```{r}
+FWD <- "GATGAAGAACGCAGCG" # CHANGE to your ITS forward primer seq
+REV <- "TCCTCCGCTTATTGATATGC" # CHANGE to your ITS reverse primer seq
+```
+
+
+### Verify presence and absence of primers within the data
+```{r}
+allOrients <- function(primer) {
+    # Create all orientations of the input sequence
+    require(Biostrings)
+    dna <- DNAString(primer)  # The Biostrings works w/ DNAString objects rather than character vectors
+    orients <- c(Forward = dna, Complement = complement(dna), Reverse = reverse(dna), 
+        RevComp = reverseComplement(dna))
+    return(sapply(orients, toString))  # Convert back to character vector
+}
+
+FWD.orients <- allOrients(FWD)
+REV.orients <- allOrients(REV)
+
+FWD.orients
+REV.orients
+```
+
+
+### Pre-filter seqs to remove ambiguous Ns - these make mapping of short primer sequences difficult
+```{r}
+fnFs.filtN <- file.path(path, "filtN", basename(fnFs)) # Put N-filterd files in filtN/ subdirectory
+fnRs.filtN <- file.path(path, "filtN", basename(fnRs))
+
+# FilterandTrim
+filterAndTrim(fnFs, fnFs.filtN, fnRs, fnRs.filtN, maxN = 0, multithread = TRUE, verbose = TRUE)
+```
+
+
+### Identify and count primers in all possible orientations
+```{r}
+primerHits <- function(primer, fn) {
+    # Counts number of reads in which the primer is found
+    nhits <- vcountPattern(primer, sread(readFastq(fn)), fixed = FALSE)
+    return(sum(nhits > 0))
+}
+
+rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = fnFs.filtN[[1]]), 
+    FWD.ReverseReads = sapply(FWD.orients, primerHits, fn = fnRs.filtN[[1]]), 
+    REV.ForwardReads = sapply(REV.orients, primerHits, fn = fnFs.filtN[[1]]), 
+    REV.ReverseReads = sapply(REV.orients, primerHits, fn = fnRs.filtN[[1]]))
+```
+
+
+### Installing and running cutadapt to trim primers
+
+Check if cutadapt is already installed on your system using `which cutadapt` on the command line. If already installed just find the path. If not - follow conda installation. In the case below we are running R and other tools from a shared server.
+
+```{r}
+# Create a conda environment for cutadapt
+conda create --name cutadapt # create the virtual environment
+conda activate cutadapt # activte the environment
+conda install -c bioconda cutadapt # install cutadapt into the new environment
+
+cutadapt <- "/usr/bin/cutadapt" # Point to cutadapt on your machine
+system2(cutadapt, args = "--version") # Use this to be able to execute shell commands from R
+```
+
+
+### Define output file names and parameters for cutadapt
+```{r}
+path.cut <- file.path(path, "cutadapt")
+if(!dir.exists(path.cut)) dir.create(path.cut)
+fnFs.cut <- file.path(path.cut, basename(fnFs))
+fnRs.cut <- file.path(path.cut, basename(fnRs))
+
+FWD.RC <- dada2:::rc(FWD)
+REV.RC <- dada2:::rc(REV)
+
+# Trim FWD and the reverse-complement of REV off of R1 (forward reads)
+R1.flags <- paste("-g", FWD, "-a", REV.RC) 
+
+# Trim REV and the reverse-complement of FWD off of R2 (reverse reads)
+R2.flags <- paste("-G", REV, "-A", FWD.RC) 
+
+# Run Cutadapt - this output will be rather long
+for(i in seq_along(fnFs)) {
+  system2(cutadapt, args = c(R1.flags, R2.flags, "-n", 2, # -n 2 required to remove FWD and REV from reads
+                             "-o", fnFs.cut[i], "-p", fnRs.cut[i], # output files
+                             fnFs.filtN[i], fnRs.filtN[i])) # input files
+}
+```
+
+
+### Sanity check for primer removal
+```{r}
+rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = fnFs.cut[[1]]), 
+    FWD.ReverseReads = sapply(FWD.orients, primerHits, fn = fnRs.cut[[1]]), 
+    REV.ForwardReads = sapply(REV.orients, primerHits, fn = fnFs.cut[[1]]), 
+    REV.ReverseReads = sapply(REV.orients, primerHits, fn = fnRs.cut[[1]]))
+```
+
+
+If everything looked good we can now go back to the "typical" DADA2 pipeline analysis.
+
+### Identify post-cut reads, create list of sample names, and view for confirmation
+```{r}
+# Forward and reverse fastq filenames have the format:
+cutFs <- sort(list.files(path.cut, pattern = "_R1_001.fastq.gz", full.names = TRUE))
+cutRs <- sort(list.files(path.cut, pattern = "_R2_001.fastq.gz", full.names = TRUE))
+
+# Extract sample names, assuming filenames have format:
+get.sample.name <- function(fname) strsplit(basename(fname), "_")[[1]][1]
+sample.names <- unname(sapply(cutFs, get.sample.name))
+head(sample.names)
+```
+
+
+### Read quality profiles
+```{r}
+plotQualityProfile(cutFs[1:3])
+plotQualityProfile(cutRs[1:3])
+```
+
+
+### Analysis with only FWD reads
+Based on our initial observations from filtering, our REV reads were not useful to take further through the pipeline. Because of this we continued with only our FWD reads through the remainder of the workflow. You can see the code that uses both FWD and REV via the DADA2 ITS pipeline tutorial (https://benjjneb.github.io/dada2/ITS_workflow.html).
+
+
+### Filter and trim
+```{r}
+filtFs <- file.path(path.cut, "filtered", basename(cutFs))
+filtRs <- file.path(path.cut, "filtered", basename(cutRs))
+
+FWD_out <- filterAndTrim(cutFs, filtFs,  
+      maxN = 0, 
+      maxEE = 2, 
+      truncQ = 2, 
+      minLen = 50, 
+      rm.phix = TRUE, 
+      compress = TRUE, multithread = 8, verbose = TRUE)  # on windows, set multithread = FALSE
+
+head(FWD_out)
+```
+
+
+### Calculate error rates and check profiles
+```{r}
+errF <- learnErrors(filtFs, verbose = TRUE, multithread = 8)
+
+plotErrors(errF, nominalQ = TRUE)
+```
+
+
+### Sample Inference
+```{r}
+dadaFs <- dada(filtFs, err=errF, multithread=8, verbose = TRUE)
+
+dadaFs[[1]]
+```
+
+
+# Name the new inference files by the sample names or they won't agree with your mapping file when handing off to phyloseq.
+```{r}
+names(dadaFs) <- sample.names
+```
+
+
+NOTE: because we are only using the FWD reads there is no step for merging here.
+
+
+### Construct sequence table
+```{r}
+FWD_seqtab <- makeSequenceTable(dadaFs, derepFs)
+dim(FWD_seqtab)
+```
+
+### Remove chimeras and inspect sequence lengths
+```{r}
+seqtab.nochim <- removeBimeraDenovo(FWD_seqtab, method="consensus", multithread=8, verbose=TRUE)
+
+table(nchar(getSequences(seqtab.nochim))) # Inspect distribution length
+# We do not remove non-target length sequences as we might have done with 16S or 18S as we expect a higher diversity of length with ITS data.
+dim(seqtab.nochim)
+sum(seqtab.nochim)/sum(seqtab)
+```
+
+
+### Track reads and output to table (Credit to Mike Lee from his Happy Belly Bioinformatics website for this code)
+```{r}
+getN <- function(x) sum(getUniques(x))
+
+  # making a little table
+Reads_summary_tab <- data.frame(row.names=sample.names, 
+                                dada2_input=FWD_out[,1],
+               filtered=FWD_out[,2], 
+               dada_f=sapply(dadaFs, getN),
+               nonchim=rowSums(seqtab.nochim),
+               final_perc_reads_retained=round(rowSums(seqtab.nochim)/out[,1]*100, 1))
+
+head(Reads_summary_tab)
+
+dir.create(here("output"))
+
+write.table(Reads_summary_tab, "output/track_reads.tsv", sep="\t", quote=F, col.names=NA)
+```
+
+
+### Assign taxonomy (to only FWD reads) and inspect 
+```{r}
+# DADA2 supports the General FASTA release of the fungal UNITE database, which can be downloaded from here - https://unite.ut.ee/repository.php
+
+unite.ref_mac <- "/path/to/UNITE/database/sh_general_release_dynamic_02.02.2019.fasta"
+
+
+FWD_taxa <- assignTaxonomy(seqtab.nochim, Ref_db, multithread = 8, tryRC = TRUE)
+
+FWD_taxa.print <- FWD_taxa  # Removing sequence rownames for display only
+rownames(FWD_taxa.print) <- NULL
+head(FWD_taxa.print, n=10)
+```
+
+
+### Output final files before input into phyloseq (credit to Mike Lee from Happy Belly Bioinformatics). This is useful if you prefer to use other tools than phyloseq for further analysis and visualization:
+- Fasta file of ASVs
+- ASV count table (as .tsv)
+- ASV taxonomy table (as .tsv)
+- Merged file including the above (as .csv)
+
+```{r}
+ # giving our seq headers more manageable names (ASV_1, ASV_2...)
+asv_seqs <- colnames(seqtab.nochim)
+asv_headers_2 <- vector(dim(seqtab.nochim)[2], mode="character")
+
+for (i in 1:dim(seqtab.nochim)[2]) {
+  asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+
+  # making and writing out a fasta of our final ASV seqs:
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+write(asv_fasta, "output/ITS_FWD_ASVs.fa")
+
+  # count table:
+asv_tab <- t(seqtab.nochim)
+row.names(asv_tab) <- sub(">", "", asv_headers)
+write.table(asv_tab, "output/ITS_FWD_ASV_counts.tsv", sep="\t", quote=F, col.names=NA)
+
+  # tax table:
+asv_tax <- FWD_taxa_UNITE_new
+row.names(asv_tax) <- sub(">", "", asv_headers)
+write.table(asv_tax, "output/ITS_FWD_ASV_taxonomy.tsv", sep="\t", quote=F, col.names=NA)
+
+# add ASV numbers to asv_seq and merge together
+asv_merge <- data.frame(asv_tab, asv_tax, asv_seqs)
+write.csv(asv_merge, "output/ITS_FWD_counts_taxa_seqs_merged.csv")
+```
+
+
+### Linking metadata file and matching up sample names
+```{r}
+samdf <- read.csv("Mapping_file.csv", header=TRUE)
+all(rownames(seqtab.nochim) %in% samdf$Seq_ID) # Test to see if names match up
+rownames(samdf) <- samdf$Seq_ID
+```
+
+### Create phyloseq object and look at stats
+```{r}
+ITS_FWD_ps <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+               sample_data(samdf), 
+               tax_table(FWD_taxa_UNITE_new)
+               #, phy_tree(FWD_fitGTR$tree) # If a phylogenetic tree was made
+               )
+ITS_FWD_ps
+```
+
+### Save phyloseq object for posterity or for sharing
+```{r}
+dir.create(here("PS_objects"))
+saveRDS(ITS_FWD_ps, here("PS_objects", "ITS_FWD_ps.rds"))
+```
+
+If desired, the individual parts that make up the phyloseq object can be saved as R files as well.
+
+```{r}
+saveRDS(seqtab.nochim, file="FWD_otu_table.rds")
+saveRDS(samdf, file="sample_data.rds")
+saveRDS(FWD_taxa, file="FWD_taxa_table.rds")
+saveRDS(FWD_fitGTR, file="FWD_phangorn_tree.rds")
+```
+
+
+This is the end of the workflow up to the point of processing and generating ASVs along with taxonomy calling. Phyloseq can now be utilized for further analysis and data visualization.
+
